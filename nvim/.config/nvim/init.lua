@@ -25,15 +25,17 @@ end
 vim.opt.rtp:prepend(lazypath)
 
 local plugins = {
-   { "maxmx03/solarized.nvim", name = "solarized", priority = 1000, lazy = false },
-    {
-    'nvim-telescope/telescope.nvim', tag = '0.1.8',
-      dependencies = { 'nvim-lua/plenary.nvim' }
-    }
+    { "maxmx03/solarized.nvim", name = "solarized", priority = 1000, lazy = false },
+    { 'nvim-telescope/telescope.nvim', tag = '0.1.8', dependencies = { 'nvim-lua/plenary.nvim' } },
+    { "nvim-treesitter/nvim-treesitter", branch = 'master', lazy = false, build = ":TSUpdate" }
 }
 local opts = {}
 
 require("lazy").setup(plugins, opts)
+
+require("solarized").setup() 
+vim.o.termguicolors = true
+vim.cmd.colorscheme 'solarized'
 
 local builtin = require('telescope.builtin')
 vim.keymap.set('n', '<leader>ff', builtin.find_files, { desc = 'Telescope find files' })
@@ -41,6 +43,17 @@ vim.keymap.set('n', '<leader>fg', builtin.live_grep, { desc = 'Telescope live gr
 vim.keymap.set('n', '<leader>fb', builtin.buffers, { desc = 'Telescope buffers' })
 vim.keymap.set('n', '<leader>fh', builtin.help_tags, { desc = 'Telescope help tags' })
 
-require("solarized").setup()
-vim.o.termguicolors = true
-vim.cmd.colorscheme 'solarized'
+require("lazy").setup({
+  {"nvim-treesitter/nvim-treesitter", branch = 'master', lazy = false, build = ":TSUpdate"}
+})
+
+local config = require('nvim-treesitter.configs')
+
+config.setup({
+  ensure_installed = { "bash", "lua", "python", "helm", "sql", "markdown", "markdown_inline" },
+  highlight = {
+    enable = true,
+    additional_vim_regex_highlighting = false,
+  },
+  indent = { enable = true },
+})
