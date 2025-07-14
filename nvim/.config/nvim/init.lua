@@ -22,7 +22,13 @@ if not (vim.uv or vim.loop).fs_stat(lazypath) then
 end
 vim.opt.rtp:prepend(lazypath)
 
-local plugins = {}
+local plugins = {
+   "maxmx03/solarized.nvim", name = "solarized", priority = 1000, lazy = false
+}
 local opts = {}
 
 require("lazy").setup(plugins, opts)
+
+require("solarized").setup()
+vim.o.termguicolors = true
+vim.cmd.colorscheme 'solarized'
