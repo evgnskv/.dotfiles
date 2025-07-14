@@ -6,4 +6,6 @@ vim.cmd("set softtabstop=2")
 vim.cmd("set autoindent")
 vim.cmd("set smartindent")
 
+vim.cmd("set number")
+
 vim.g.mapleader = " "
