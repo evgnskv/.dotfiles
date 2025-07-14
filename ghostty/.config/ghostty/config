@@ -1,4 +1,4 @@
-theme = dark:Builtin Solarized Dark,light:Builtin Solarized Light
+theme = dark:tokyonight,light:tokyonight-day
 
 font-family = "MesloLGS Nerd Font Mono Regular"
 font-family-bold = "MesloLGS Nerd Font Mono Bold"
