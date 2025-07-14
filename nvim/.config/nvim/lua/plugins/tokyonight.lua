@@ -1,7 +1,7 @@
-return { 
-  "folke/tokyonight.nvim", 
-  name = "tokyonight", 
-  priority = 1000, 
+return {
+  "folke/tokyonight.nvim",
+  name = "tokyonight",
+  priority = 1000,
   lazy = false,
 
   config = function()

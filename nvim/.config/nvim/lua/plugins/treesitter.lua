@@ -1,16 +1,17 @@
 return {
   "nvim-treesitter/nvim-treesitter",
   branch = 'master',
-  lazy = false, 
+  lazy = false,
   build = ":TSUpdate",
 
   config = function()
     local config = require('nvim-treesitter.configs')
     config.setup({
-      ensure_installed = { 
+      ensure_installed = {
         "bash",
         "lua",
         "python",
+        "ruby",
         "helm",
         "sql",
         "markdown",
