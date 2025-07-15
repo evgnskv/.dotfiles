@@ -7,16 +7,7 @@ return {
   config = function()
     local config = require('nvim-treesitter.configs')
     config.setup({
-      ensure_installed = {
-        "bash",
-        "lua",
-        "python",
-        "ruby",
-        "helm",
-        "sql",
-        "markdown",
-        "markdown_inline"
-        },
+      auto_install = true,
       highlight = {
         enable = true,
         additional_vim_regex_highlighting = false,
