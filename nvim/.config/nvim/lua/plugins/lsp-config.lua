@@ -1,11 +1,5 @@
 return {
     {
-        "mason-org/mason.nvim",
-        config = function()
-            require("mason").setup()
-        end,
-    },
-    {
         "mason-org/mason-lspconfig.nvim",
         opts = {},
         dependencies = {
@@ -23,7 +17,6 @@ return {
                     "helm_ls",  -- LSP https://github.com/mrjosh/helm-ls
                     "sqls",     -- LSP https://github.com/sqls-server/sqls
                 },
-
                 automatic_enable = true,
             })
         end,
