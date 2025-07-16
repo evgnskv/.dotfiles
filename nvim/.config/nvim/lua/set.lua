@@ -8,6 +8,8 @@ vim.cmd("set smartindent")
 
 vim.cmd("set number")
 
+vim.cmd("set clipboard=unnamedplus")
+
 vim.opt.swapfile = false
 vim.wo.number = true
 
