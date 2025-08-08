@@ -1,0 +1,11 @@
+{
+  "promptDelete": false,
+  "showLineNumber": true,
+  "vimMode": true,
+  "attachmentFolderPath": "99_Attachments",
+  "newFileLocation": "folder",
+  "newFileFolderPath": "00_Inbox",
+  "foldIndent": false,
+  "useTab": false,
+  "alwaysUpdateLinks": true
+}
