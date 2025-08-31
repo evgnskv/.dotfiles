@@ -1,3 +1,6 @@
+macos-titlebar-proxy-icon = hidden
+title = " "
+
 theme = dark:tokyonight,light:tokyonight-day
 
 font-family = "MesloLGS Nerd Font Mono Regular"
