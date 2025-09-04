@@ -11,37 +11,38 @@ return {
   end,
 
   keys = function()
-  local find_buffer_by_type = function(type)
-    for _, buf in ipairs(vim.api.nvim_list_bufs()) do
-      local ft = vim.api.nvim_buf_get_option(buf, "filetype")
-      if ft == type then return buf end
+    local find_buffer_by_type = function(type)
+      for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+        local ft = vim.api.nvim_buf_get_option(buf, "filetype")
+        if ft == type then return buf end
+      end
+      return -1
     end
-    return -1
-  end
 
-  local toggle_neotree = function(toggle_command)
-    if find_buffer_by_type "neo-tree" > 0 then
-      require("neo-tree.command").execute { action = "close" }
-    else
-      toggle_command()
+    local toggle_neotree = function(toggle_command)
+      if find_buffer_by_type "neo-tree" > 0 then
+        require("neo-tree.command").execute { action = "close" }
+      else
+        toggle_command()
+      end
     end
-  end
 
-  return {
-    {
-      "<leader>e",
-      function()
-        toggle_neotree(function() require("neo-tree.command").execute {
-            action = "focus",
-            reveal = true,
-            dir = vim.uv.cwd()
-          } end)
-      end,
-      desc = "Toggle Explorer (cwd)",
-    },
-  }
-
-end,
+    return {
+      {
+        "<leader>e",
+        function()
+          toggle_neotree(function()
+            require("neo-tree.command").execute {
+              action = "focus",
+              reveal = true,
+              dir = vim.uv.cwd()
+            }
+          end)
+        end,
+        desc = "Toggle Explorer (cwd)",
+      },
+    }
+  end,
   opts = {
     filesystem = {
       filtered_items = {
