@@ -93,6 +93,8 @@ source $ZSH/oh-my-zsh.sh
 export EDITOR='nvim'
 export PAGER="nvim +Man! -"
 
+alias nvimp="nvim +Man! -"
+
 # Compilation flags
 # export ARCHFLAGS="-arch $(uname -m)"
 
