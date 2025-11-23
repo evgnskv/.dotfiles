@@ -1,0 +1,6 @@
+[user]
+	name = evgnskv
+	email = evgnskv@pm.me
+	username = evgnskv
+[core]
+  excludesFile = "~/.config/git/.gitignore"
