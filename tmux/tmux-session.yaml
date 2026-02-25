@@ -1,0 +1,14 @@
+monitor:
+  - htop:
+      root:
+        cmd: "htop"
+
+dotfiles:
+  - local:
+      root:
+        dir: "~/.dotfiles" 
+        cmd: "vim ." 
+        v:
+          dir: "~/.dotfiles" 
+          cmd: "git status" 
+          size: 15

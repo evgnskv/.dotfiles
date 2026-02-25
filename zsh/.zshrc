@@ -2,7 +2,9 @@
 # export PATH=$HOME/bin:$HOME/.local/bin:/usr/local/bin:$PATH
 
 # Path to your Oh My Zsh installation.
-export ZSH="$HOME/.oh-my-zsh"
+#export ZSH="$HOME/.oh-my-zsh"
+export ZSH="/nix/store/gymy70qlc7fr4z0lgdbjbhg66m36f2rr-oh-my-zsh-2025-04-29/share/oh-my-zsh"
+
 export LANG=en_US.UTF-8
 
 export XDG_CONFIG_HOME="$HOME/.config"
