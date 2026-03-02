@@ -7,7 +7,7 @@ ACTION=""
 VERBOSE=0
 
 log() {
-    [[ "$VERBOSE" -eq 1 ]] && echo "$@" || true
+    [[ "$VERBOSE" -eq 1 ]] && echo "$@" >&2 || true
 }
 
 while [[ $# -gt 0 ]]; do
@@ -54,12 +54,38 @@ if ! command -v tmux &> /dev/null; then
     exit 1
 fi
 
+# --- Helper functions ---
+
+# Check if a session with the exact name exists.
+# tmux has-session uses prefix matching, so we use list-sessions instead.
+session_exists() {
+    tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -qxF "$1"
+}
+
 # Check if a window with exact name exists in a session.
-# Uses tmux format to get exact window names, avoiding substring issues.
+# The "=" prefix forces tmux to match the session name exactly.
 window_exists() {
-    local session="$1"
-    local window_name="$2"
-    tmux list-windows -t "$session" -F '#{window_name}' 2>/dev/null | grep -qxF "$window_name"
+    tmux list-windows -t "=$1" -F '#{window_name}' 2>/dev/null | grep -qxF "$2"
+}
+
+# Look up a window's index by name in a session.
+# Returns the index or empty string.
+get_window_index() {
+    local session="$1" name="$2" i n
+    while IFS=: read -r i n; do
+        if [[ "$n" == "$name" ]]; then echo "$i"; return; fi
+    done < <(tmux list-windows -t "=$session" -F '#{window_index}:#{window_name}' 2>/dev/null)
+    return 0
+}
+
+# Look up a window's name by index in a session.
+# Returns the name or empty string.
+get_window_name() {
+    local session="$1" idx="$2" i n
+    while IFS=: read -r i n; do
+        if [[ "$i" == "$idx" ]]; then echo "$n"; return; fi
+    done < <(tmux list-windows -t "=$session" -F '#{window_index}:#{window_name}' 2>/dev/null)
+    return 0
 }
 
 # Build the shell command string to send to a pane (cd + command).
@@ -69,11 +95,12 @@ build_exec_cmd() {
 
     local exec_cmd=""
     if [[ -n "$dir" && "$dir" != "null" ]]; then
-        if [[ ! -d "$dir" ]]; then
+        local expanded_dir="${dir/#\~/$HOME}"
+        if [[ ! -d "$expanded_dir" ]]; then
             log "Warning: directory '$dir' does not exist"
             return 1
         fi
-        exec_cmd="cd \"$dir\" && clear"
+        exec_cmd="cd \"$expanded_dir\" && clear"
         if [[ -n "$cmd" && "$cmd" != "null" ]]; then
             exec_cmd="$exec_cmd && $cmd"
         fi
@@ -88,11 +115,12 @@ build_exec_cmd() {
 # Arguments: pane_spec_json, parent_pane_id, split_direction
 # For the root call, parent_pane_id is the existing first pane, split_direction is "".
 #
-# Each pane spec may contain:
-#   cmd:   command to run in the pane
-#   dir:   working directory
-#   size:  percentage for the split
-#   split: list of child splits, each a single-key map {h: <child_spec>} or {v: <child_spec>}
+# Each pane spec is a JSON object that may contain:
+#   cmd:  command to run in the pane
+#   dir:  working directory
+#   size: percentage for the split
+#   h:    child pane spec to split horizontally (side by side)
+#   v:    child pane spec to split vertically (top/bottom)
 process_pane_tree() {
     local pane_spec="$1"
     local parent="$2"
@@ -104,11 +132,11 @@ process_pane_tree() {
     size=$(yq -r '.size // empty' <<< "$pane_spec")
 
     local exec_cmd
-    exec_cmd=$(build_exec_cmd "$cmd" "$dir")
+    exec_cmd=$(build_exec_cmd "$cmd" "$dir") || true
     local current_pane
 
     if [[ -n "$split_dir" ]]; then
-        # This is a child pane - split from parent
+        # This is a child pane — split from parent
         local split_args=("-t" "$parent")
 
         if [[ "$split_dir" == "h" ]]; then
@@ -116,14 +144,14 @@ process_pane_tree() {
         fi
         # "v" is the default for tmux split-window, no flag needed
 
-        if [[ -n "$size" && "$size" != "null" ]]; then
+        if [[ -n "$size" ]]; then
             split_args+=("-p" "$size")
         fi
 
         current_pane=$(tmux split-window -P -F '#{pane_id}' "${split_args[@]}")
         log "Split $split_dir from $parent -> $current_pane"
     else
-        # Root pane - parent is already the first pane of the window
+        # Root pane — parent is already the first pane of the window
         current_pane="$parent"
     fi
 
@@ -132,39 +160,14 @@ process_pane_tree() {
         tmux send-keys -t "$current_pane" "$exec_cmd" C-m
     fi
 
-    # Recurse into child splits
-    local split_count
-    split_count=$(yq -r '.split // [] | length' <<< "$pane_spec")
-
-    local i child_item dir_key child_spec
-    for ((i=0; i<split_count; i++)); do
-        child_item=$(yq -r ".split[$i]" <<< "$pane_spec")
-        dir_key=$(yq -r 'keys | .[0]' <<< "$child_item")
-        child_spec=$(yq -r ".$dir_key" <<< "$child_item")
-
-        if [[ -n "$dir_key" && "$dir_key" != "null" && -n "$child_spec" && "$child_spec" != "null" ]]; then
+    # Recurse into h/v child splits (direct keys on the pane node)
+    local child_spec
+    for dir_key in h v; do
+        child_spec=$(yq -r ".$dir_key // empty" <<< "$pane_spec")
+        if [[ -n "$child_spec" ]]; then
             process_pane_tree "$child_spec" "$current_pane" "$dir_key"
         fi
     done
-}
-
-# Look up a window's index by name, or name by index, in a session.
-# Usage: get_window_index <session> <window_name>  -> prints index or ""
-#        get_window_name  <session> <window_index>  -> prints name or ""
-get_window_index() {
-    local result=""
-    while IFS=: read -r i n; do
-        [[ "$n" == "$2" ]] && result="$i" && break
-    done < <(tmux list-windows -t "$1" -F '#{window_index}:#{window_name}' 2>/dev/null)
-    echo "$result"
-}
-
-get_window_name() {
-    local result=""
-    while IFS=: read -r i n; do
-        [[ "$i" == "$2" ]] && result="$n" && break
-    done < <(tmux list-windows -t "$1" -F '#{window_index}:#{window_name}' 2>/dev/null)
-    echo "$result"
 }
 
 # Reorder windows in a session to match config order.
@@ -176,7 +179,7 @@ reorder_windows() {
 
     [[ ${#config_windows[@]} -eq 0 ]] && return
 
-    # Check if windows are already in correct order - skip if nothing to do
+    # Check if windows are already in correct order — skip if nothing to do
     local needs_reorder=0
     for ((idx=0; idx<${#config_windows[@]}; idx++)); do
         local actual_name
@@ -188,12 +191,12 @@ reorder_windows() {
     done
     [[ "$needs_reorder" -eq 0 ]] && return
 
-    # Move only config windows to temp indices (1000+) to free target slots
+    # Move config windows to temp indices (1000+) to free target slots
     local wi temp_base=1000
     for wn in "${config_windows[@]}"; do
         wi=$(get_window_index "$session" "$wn")
         if [[ -n "$wi" ]]; then
-            tmux move-window -s "$session:$wi" -t "$session:$((temp_base++))" 2>/dev/null || true
+            tmux move-window -s "=$session:$wi" -t "=$session:$((temp_base++))" 2>/dev/null || true
         fi
     done
 
@@ -206,8 +209,15 @@ reorder_windows() {
         current_idx=$(get_window_index "$session" "$target_name")
 
         if [[ -n "$current_idx" && "$current_idx" != "$idx" ]]; then
+            # If target slot is occupied by a non-config window, swap it out first
+            local occupant
+            occupant=$(get_window_name "$session" "$idx")
+            if [[ -n "$occupant" && "$occupant" != "$target_name" ]]; then
+                tmux swap-window -s "=$session:$current_idx" -t "=$session:$idx" 2>/dev/null || true
+            else
+                tmux move-window -s "=$session:$current_idx" -t "=$session:$idx" 2>/dev/null || true
+            fi
             log "Reorder: move $session:$current_idx ($target_name) -> $session:$idx"
-            tmux move-window -s "$session:$current_idx" -t "$session:$idx" 2>/dev/null || true
         fi
     done
 }
@@ -224,13 +234,13 @@ if [[ "$ACTION" == "prune" ]]; then
 
         if [[ "$session_found" -eq 0 ]]; then
             log "Pruning session: $session"
-            tmux kill-session -t "$session" 2>/dev/null || true
+            tmux kill-session -t "=$session" 2>/dev/null || true
         else
             # Get config window names for this session
             mapfile -t config_windows < <(yq -r ".\"$session\"[] | keys | .[]" "$CONFIG" | grep -v '^$')
-            window_count=$(tmux list-windows -t "$session" 2>/dev/null | wc -l)
+            window_count=$(tmux list-windows -t "=$session" 2>/dev/null | wc -l)
 
-            for window in $(tmux list-windows -t "$session" -F '#{window_name}' 2>/dev/null); do
+            for window in $(tmux list-windows -t "=$session" -F '#{window_name}' 2>/dev/null); do
                 window_found=0
                 for cw in "${config_windows[@]}"; do
                     [[ "$cw" == "$window" ]] && window_found=1 && break
@@ -238,7 +248,7 @@ if [[ "$ACTION" == "prune" ]]; then
 
                 if [[ "$window_found" -eq 0 && "$window_count" -gt 1 ]]; then
                     log "Pruning window: $session:$window"
-                    tmux kill-window -t "$session:=$window" 2>/dev/null || true
+                    tmux kill-window -t "=$session:=$window" 2>/dev/null || true
                     window_count=$((window_count - 1))
                 fi
             done
@@ -258,7 +268,7 @@ for session in "${yaml_sessions[@]}"; do
     [[ -z "$session" ]] && continue
     session_is_new=0
 
-    if tmux has-session -t "$session" 2>/dev/null; then
+    if session_exists "$session"; then
         log "Session '$session' already exists"
     else
         log "Creating session: $session"
@@ -272,22 +282,18 @@ for session in "${yaml_sessions[@]}"; do
         window_name=$(yq -r '.["'"$session"'"]['"$window_idx"'] | keys | .[0]' "$CONFIG")
         [[ -z "$window_name" || "$window_name" == "null" ]] && continue
 
-        if window_exists "$session" "$window_name"; then
+        # For a brand-new session, the first config window reuses the default window
+        if [[ "$window_idx" -eq 0 && "$session_is_new" -eq 1 ]]; then
+            first_window=$(tmux list-windows -t "=$session" -F '#{window_index}' | head -1)
+            log "Renaming default window $first_window to: $window_name"
+            tmux rename-window -t "=$session:$first_window" "$window_name"
+            first_pane=$(tmux list-panes -t "=$session:$first_window" -F '#{pane_id}' | head -1)
+        elif window_exists "$session" "$window_name"; then
             log "Window '$session:$window_name' already exists, skipping"
             continue
-        fi
-
-        # Window does not exist - create it and capture its first pane ID
-        first_pane=""
-        if [[ "$window_idx" -eq 0 && "$session_is_new" -eq 1 ]]; then
-            # Session was just created by us, rename its default window
-            first_window=$(tmux list-windows -t "$session" -F '#{window_index}' | head -1)
-            log "Renaming default window $first_window to: $window_name"
-            tmux rename-window -t "$session:$first_window" "$window_name"
-            first_pane=$(tmux list-panes -t "$session:$first_window" -F '#{pane_id}' | head -1)
         else
             log "Creating window: $session:$window_name"
-            first_pane=$(tmux new-window -P -F '#{pane_id}' -t "$session:" -n "$window_name")
+            first_pane=$(tmux new-window -P -F '#{pane_id}' -t "=$session:" -n "$window_name")
         fi
 
         # Set up panes for the new window
@@ -305,9 +311,9 @@ first_session=$(yq -r 'keys | .[0]' "$CONFIG")
 
 if [[ "$ACTION" == "attach" ]]; then
     if [[ -n "$TMUX" ]]; then
-        tmux switch-client -t "$first_session"
+        tmux switch-client -t "=$first_session"
     else
-        tmux attach-session -t "$first_session"
+        tmux attach-session -t "=$first_session"
     fi
 elif [[ "$ACTION" == "list" ]]; then
     if [[ -z "$TMUX" ]]; then
