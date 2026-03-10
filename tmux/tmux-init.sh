@@ -1,10 +1,22 @@
 #!/usr/bin/env bash
 
-set -e
+set -euo pipefail
+
+TAB=$'\t'
 
 CONFIG="./tmux-session.yaml"
 ACTION=""
 VERBOSE=0
+
+declare -a CONFIG_SESSIONS=()
+declare -a LIVE_SESSIONS=()
+declare -a CONFIG_WINDOWS=()
+declare -a LIVE_WINDOWS=()
+declare -A SESSION_WINDOW_COUNTS=()
+declare -A WINDOW_ROOT_SPECS=()
+declare -A SESSION_WINDOWS_JOINED=()
+declare -A WINDOW_INDEX_BY_NAME=()
+declare -A WINDOW_NAME_BY_INDEX=()
 
 log() {
     [[ "$VERBOSE" -eq 1 ]] && echo "$@" >&2 || true
@@ -54,42 +66,95 @@ if ! command -v tmux &> /dev/null; then
     exit 1
 fi
 
-# --- Helper functions ---
+if ! command -v jq &> /dev/null; then
+    echo "Error: jq is not installed"
+    exit 1
+fi
 
-# Check if a session with the exact name exists.
-# tmux has-session uses prefix matching, so we use list-sessions instead.
 session_exists() {
     tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -qxF "$1"
 }
 
-# Check if a window with exact name exists in a session.
-# The "=" prefix forces tmux to match the session name exactly.
 window_exists() {
     tmux list-windows -t "=$1" -F '#{window_name}' 2>/dev/null | grep -qxF "$2"
 }
 
-# Look up a window's index by name in a session.
-# Returns the index or empty string.
 get_window_index() {
-    local session="$1" name="$2" i n
-    while IFS=: read -r i n; do
-        if [[ "$n" == "$name" ]]; then echo "$i"; return; fi
-    done < <(tmux list-windows -t "=$session" -F '#{window_index}:#{window_name}' 2>/dev/null)
-    return 0
+    local key="$1$TAB$2"
+    printf '%s\n' "${WINDOW_INDEX_BY_NAME[$key]-}"
 }
 
-# Look up a window's name by index in a session.
-# Returns the name or empty string.
 get_window_name() {
-    local session="$1" idx="$2" i n
-    while IFS=: read -r i n; do
-        if [[ "$i" == "$idx" ]]; then echo "$n"; return; fi
-    done < <(tmux list-windows -t "=$session" -F '#{window_index}:#{window_name}' 2>/dev/null)
-    return 0
+    local key="$1$TAB$2"
+    printf '%s\n' "${WINDOW_NAME_BY_INDEX[$key]-}"
 }
 
-# Expand ~ to $HOME and validate directory existence.
-# Echoes the expanded path. Returns 1 if dir does not exist.
+refresh_window_maps() {
+    local session="$1" i n key
+
+    while IFS=: read -r i n; do
+        key="$session$TAB$n"
+        WINDOW_INDEX_BY_NAME["$key"]="$i"
+        key="$session$TAB$i"
+        WINDOW_NAME_BY_INDEX["$key"]="$n"
+    done < <(tmux list-windows -t "=$session" -F '#{window_index}:#{window_name}' 2>/dev/null)
+}
+
+in_array() {
+    local needle="$1"
+    shift
+    local item
+    for item in "$@"; do
+        [[ "$item" == "$needle" ]] && return 0
+    done
+    return 1
+}
+
+read_config_sessions() {
+    mapfile -t CONFIG_SESSIONS < <(yq -r 'keys[]' "$CONFIG" 2>/dev/null | grep -v '^$')
+}
+
+read_config_windows() {
+    local session="$1"
+    IFS='|' read -r -a CONFIG_WINDOWS <<< "${SESSION_WINDOWS_JOINED[$session]-}"
+}
+
+read_live_sessions() {
+    mapfile -t LIVE_SESSIONS < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+}
+
+read_live_windows() {
+    local session="$1"
+    mapfile -t LIVE_WINDOWS < <(tmux list-windows -t "=$session" -F '#{window_name}' 2>/dev/null)
+}
+
+window_total() {
+    tmux list-windows -t "=$1" -F '#{window_index}' 2>/dev/null | wc -l
+}
+
+load_config() {
+    local config_json session window_count window_idx window_name root_spec
+
+    config_json=$(yq '.' "$CONFIG")
+    mapfile -t CONFIG_SESSIONS < <(jq -r 'keys_unsorted[]' <<< "$config_json" | grep -v '^$')
+
+    for session in "${CONFIG_SESSIONS[@]}"; do
+        window_count=$(jq -r --arg session "$session" '.[$session] | length' <<< "$config_json")
+        SESSION_WINDOW_COUNTS["$session"]="$window_count"
+        CONFIG_WINDOWS=()
+
+        for ((window_idx=0; window_idx<window_count; window_idx++)); do
+            window_name=$(jq -r --arg session "$session" --argjson index "$window_idx" '.[$session][$index] | keys_unsorted[0] // empty' <<< "$config_json")
+            [[ -z "$window_name" || "$window_name" == "null" ]] && continue
+            CONFIG_WINDOWS+=("$window_name")
+            root_spec=$(jq -c --arg session "$session" --argjson index "$window_idx" --arg window "$window_name" '.[$session][$index][$window].root // null' <<< "$config_json")
+            WINDOW_ROOT_SPECS["$session$TAB$window_idx"]="$root_spec"
+        done
+
+        SESSION_WINDOWS_JOINED["$session"]=$(IFS='|'; printf '%s' "${CONFIG_WINDOWS[*]-}")
+    done
+}
+
 expand_dir() {
     local dir="$1"
     local expanded="${dir/#\~/$HOME}"
@@ -100,38 +165,30 @@ expand_dir() {
     echo "$expanded"
 }
 
-# Global array to collect deferred send-keys commands.
-# Each entry is "pane_id<TAB>cmd" — flushed after all panes in a window are created.
 DEFERRED_CMDS=()
-# Track the last pane created by split-window, so we can wait for its shell.
 LAST_SPLIT_PANE=""
 
-# Wait for a pane's shell to be ready (prompt drawn) before sending keys.
-# Polls cursor_x — once the shell prompt appears, cursor moves past column 0.
 wait_for_pane() {
     local pane="$1" cx
-    for _ in $(seq 1 50); do
+    for _ in {1..12}; do
         cx=$(tmux display-message -p -t "$pane" '#{cursor_x}' 2>/dev/null) || return 0
         [[ "$cx" -gt 0 ]] && return 0
-        sleep 0.02
+        sleep 0.01
     done
-    # Timed out (1s) — proceed anyway
     log "Warning: timed out waiting for pane $pane to be ready"
 }
 
 flush_deferred_cmds() {
     [[ ${#DEFERRED_CMDS[@]} -eq 0 ]] && return
 
-    # Wait for the last split pane's shell to initialize before sending any keys.
-    # Earlier panes have had more time and are typically ready already.
     if [[ -n "$LAST_SPLIT_PANE" ]]; then
         wait_for_pane "$LAST_SPLIT_PANE"
     fi
 
     local pane_id cmd
     for entry in "${DEFERRED_CMDS[@]}"; do
-        pane_id="${entry%%	*}"
-        cmd="${entry#*	}"
+        pane_id="${entry%%$TAB*}"
+        cmd="${entry#*$TAB}"
         log "Sending cmd to $pane_id: $cmd"
         tmux send-keys -t "$pane_id" "$cmd" C-m
     done
@@ -139,49 +196,30 @@ flush_deferred_cmds() {
     LAST_SPLIT_PANE=""
 }
 
-# Recursively create panes from the YAML pane tree.
-# Arguments: pane_spec_json, parent_pane_id, split_direction
-# For the root call, parent_pane_id is the existing first pane, split_direction is "".
-#
-# Each pane spec is a JSON object that may contain:
-#   cmd:   command to run in the pane
-#   dir:   working directory
-#   size:  percentage for the split
-#   split: ordered list of child split specs, each item shaped as:
-#          - h: { ...child pane spec... }
-#          - v: { ...child pane spec... }
-#
-# Multiple same-orientation splits for the same parent are supported because
-# child splits are read from the ordered split[] array instead of fixed h/v keys.
-# Pane creation happens immediately, but commands are deferred to DEFERRED_CMDS
-# and sent after all panes in the window exist.
 process_pane_tree() {
     local pane_spec="$1"
     local parent="$2"
     local split_dir="$3"
 
     local cmd dir size split_count
-    cmd=$(yq -r '.cmd // empty' <<< "$pane_spec")
-    dir=$(yq -r '.dir // empty' <<< "$pane_spec")
-    size=$(yq -r '.size // empty' <<< "$pane_spec")
-    split_count=$(yq -r '.split | length // 0' <<< "$pane_spec" 2>/dev/null || printf '0')
+    cmd=$(jq -r '.cmd // empty' <<< "$pane_spec")
+    dir=$(jq -r '.dir // empty' <<< "$pane_spec")
+    size=$(jq -r '.size // empty' <<< "$pane_spec")
+    split_count=$(jq -r '.split | length // 0' <<< "$pane_spec" 2>/dev/null || printf '0')
 
     local current_pane expanded_dir
 
     if [[ -n "$split_dir" ]]; then
-        # This is a child pane — split from parent
         local split_args=("-t" "$parent")
 
         if [[ "$split_dir" == "h" ]]; then
             split_args+=("-h")
         fi
-        # "v" is the default for tmux split-window, no flag needed
 
         if [[ -n "$size" ]]; then
             split_args+=("-p" "$size")
         fi
 
-        # Use -c for working directory if specified
         if [[ -n "$dir" ]]; then
             expanded_dir=$(expand_dir "$dir") && split_args+=("-c" "$expanded_dir")
         fi
@@ -190,39 +228,34 @@ process_pane_tree() {
         LAST_SPLIT_PANE="$current_pane"
         log "Split $split_dir from $parent -> $current_pane"
     else
-        # Root pane — parent is already the first pane of the window.
-        # Apply working directory via send-keys cd (no split to attach -c to).
         current_pane="$parent"
         if [[ -n "$dir" ]]; then
-            expanded_dir=$(expand_dir "$dir") && DEFERRED_CMDS+=("${current_pane}	cd \"$expanded_dir\" && clear")
+            expanded_dir=$(expand_dir "$dir") && DEFERRED_CMDS+=("${current_pane}${TAB}cd \"$expanded_dir\" && clear")
         fi
     fi
 
-    # Defer the command to be sent after all panes are created
     if [[ -n "$cmd" && -n "$current_pane" ]]; then
-        DEFERRED_CMDS+=("${current_pane}	${cmd}")
+        DEFERRED_CMDS+=("${current_pane}${TAB}${cmd}")
     fi
 
     local split_idx child_dir child_spec
     for ((split_idx=0; split_idx<split_count; split_idx++)); do
-        child_dir=$(yq -r ".split[$split_idx] | keys | .[0]" <<< "$pane_spec")
+        child_dir=$(jq -r ".split[$split_idx] | keys[0] // empty" <<< "$pane_spec")
         [[ "$child_dir" != "h" && "$child_dir" != "v" ]] && continue
-        child_spec=$(yq -r ".split[$split_idx].$child_dir" <<< "$pane_spec")
+        child_spec=$(jq -c ".split[$split_idx].$child_dir" <<< "$pane_spec")
         [[ -z "$child_spec" || "$child_spec" == "null" ]] && continue
         process_pane_tree "$child_spec" "$current_pane" "$child_dir"
     done
 }
 
-# Reorder windows in a session to match config order.
-# Only moves config windows; non-config windows are left in place (shifted as needed).
 reorder_windows() {
     local session="$1"
     shift
     local -a config_windows=("$@")
 
     [[ ${#config_windows[@]} -eq 0 ]] && return
+    refresh_window_maps "$session"
 
-    # Check if windows are already in correct order — skip if nothing to do
     local needs_reorder=0
     for ((idx=0; idx<${#config_windows[@]}; idx++)); do
         local actual_name
@@ -234,7 +267,6 @@ reorder_windows() {
     done
     [[ "$needs_reorder" -eq 0 ]] && return
 
-    # Move config windows to temp indices (1000+) to free target slots
     local wi temp_base=1000
     for wn in "${config_windows[@]}"; do
         wi=$(get_window_index "$session" "$wn")
@@ -243,7 +275,8 @@ reorder_windows() {
         fi
     done
 
-    # Move config windows back to their desired positions
+    refresh_window_maps "$session"
+
     for ((idx=0; idx<${#config_windows[@]}; idx++)); do
         local target_name="${config_windows[$idx]}"
         [[ -z "$target_name" ]] && continue
@@ -252,7 +285,6 @@ reorder_windows() {
         current_idx=$(get_window_index "$session" "$target_name")
 
         if [[ -n "$current_idx" && "$current_idx" != "$idx" ]]; then
-            # If target slot is occupied by a non-config window, swap it out first
             local occupant
             occupant=$(get_window_name "$session" "$idx")
             if [[ -n "$occupant" && "$occupant" != "$target_name" ]]; then
@@ -263,53 +295,40 @@ reorder_windows() {
             log "Reorder: move $session:$current_idx ($target_name) -> $session:$idx"
         fi
     done
+
+    refresh_window_maps "$session"
 }
 
-# --- PRUNE ACTION ---
 if [[ "$ACTION" == "prune" ]]; then
-    mapfile -t config_sessions < <(yq -r 'keys_unsorted | .[]' "$CONFIG" | grep -v '^$')
+    load_config
+    read_live_sessions
 
-    mapfile -t live_sessions < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
-    for session in "${live_sessions[@]}"; do
-        session_found=0
-        for cs in "${config_sessions[@]}"; do
-            [[ "$cs" == "$session" ]] && session_found=1 && break
-        done
-
-        if [[ "$session_found" -eq 0 ]]; then
+    for session in "${LIVE_SESSIONS[@]}"; do
+        if ! in_array "$session" "${CONFIG_SESSIONS[@]}"; then
             log "Pruning session: $session"
             tmux kill-session -t "=$session" 2>/dev/null || true
         else
-            # Get config window names for this session
-            mapfile -t config_windows < <(yq -r ".\"$session\"[] | keys | .[]" "$CONFIG" | grep -v '^$')
-            window_count=$(tmux list-windows -t "=$session" 2>/dev/null | wc -l)
+            read_config_windows "$session"
+            window_count=$(window_total "$session")
+            read_live_windows "$session"
 
-            mapfile -t live_windows < <(tmux list-windows -t "=$session" -F '#{window_name}' 2>/dev/null)
-            for window in "${live_windows[@]}"; do
-                window_found=0
-                for cw in "${config_windows[@]}"; do
-                    [[ "$cw" == "$window" ]] && window_found=1 && break
-                done
-
-                if [[ "$window_found" -eq 0 && "$window_count" -gt 1 ]]; then
+            for window in "${LIVE_WINDOWS[@]}"; do
+                if ! in_array "$window" "${CONFIG_WINDOWS[@]}" && [[ "$window_count" -gt 1 ]]; then
                     log "Pruning window: $session:$window"
                     tmux kill-window -t "=$session:=$window" 2>/dev/null || true
                     window_count=$((window_count - 1))
                 fi
             done
 
-            # Reorder remaining windows to match config
-            reorder_windows "$session" "${config_windows[@]}"
+            reorder_windows "$session" "${CONFIG_WINDOWS[@]}"
         fi
     done
     exit 0
 fi
 
-# --- DEFAULT / ATTACH / LIST ACTION ---
+load_config
 
-mapfile -t yaml_sessions < <(yq -r 'keys_unsorted | .[]' "$CONFIG" | grep -v '^$')
-
-for session in "${yaml_sessions[@]}"; do
+for session in "${CONFIG_SESSIONS[@]}"; do
     [[ -z "$session" ]] && continue
     session_is_new=0
 
@@ -321,18 +340,18 @@ for session in "${yaml_sessions[@]}"; do
         session_is_new=1
     fi
 
-    window_count=$(yq -r '.["'"$session"'"] | length' "$CONFIG")
+    window_count="${SESSION_WINDOW_COUNTS[$session]}"
+    read_config_windows "$session"
 
     for ((window_idx=0; window_idx<window_count; window_idx++)); do
-        window_name=$(yq -r '.["'"$session"'"]['"$window_idx"'] | keys | .[0]' "$CONFIG")
+        window_name="${CONFIG_WINDOWS[$window_idx]-}"
         [[ -z "$window_name" || "$window_name" == "null" ]] && continue
 
-        # For a brand-new session, the first config window reuses the default window
         if [[ "$window_idx" -eq 0 && "$session_is_new" -eq 1 ]]; then
-            first_window=$(tmux list-windows -t "=$session" -F '#{window_index}' | head -1)
+            first_window=$(tmux list-windows -t "=$session" -F '#{window_index}' | sed -n '1p')
             log "Renaming default window $first_window to: $window_name"
             tmux rename-window -t "=$session:$first_window" "$window_name"
-            first_pane=$(tmux list-panes -t "=$session:$first_window" -F '#{pane_id}' | head -1)
+            first_pane=$(tmux list-panes -t "=$session:$first_window" -F '#{pane_id}' | sed -n '1p')
         elif window_exists "$session" "$window_name"; then
             log "Window '$session:$window_name' already exists, skipping"
             continue
@@ -341,8 +360,7 @@ for session in "${yaml_sessions[@]}"; do
             first_pane=$(tmux new-window -P -F '#{pane_id}' -t "=$session:" -n "$window_name")
         fi
 
-        # Set up panes for the new window
-        root_pane_spec=$(yq -r '.["'"$session"'"]['"$window_idx"']["'"$window_name"'"].root' "$CONFIG")
+        root_pane_spec="${WINDOW_ROOT_SPECS["$session$TAB$window_idx"]-}"
 
         if [[ -n "$root_pane_spec" && "$root_pane_spec" != "null" && -n "$first_pane" ]]; then
             DEFERRED_CMDS=()
@@ -352,9 +370,7 @@ for session in "${yaml_sessions[@]}"; do
     done
 done
 
-# --- POST-ACTION ---
-
-first_session=$(yq -r 'keys_unsorted | .[0]' "$CONFIG")
+first_session="${CONFIG_SESSIONS[0]-}"
 
 if [[ "$ACTION" == "attach" ]]; then
     if [[ -n "$TMUX" ]]; then
