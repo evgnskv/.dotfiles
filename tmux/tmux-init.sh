@@ -88,27 +88,55 @@ get_window_name() {
     return 0
 }
 
-# Build the shell command string to send to a pane (cd + command).
-build_exec_cmd() {
-    local cmd="$1"
-    local dir="$2"
+# Expand ~ to $HOME and validate directory existence.
+# Echoes the expanded path. Returns 1 if dir does not exist.
+expand_dir() {
+    local dir="$1"
+    local expanded="${dir/#\~/$HOME}"
+    if [[ ! -d "$expanded" ]]; then
+        log "Warning: directory '$dir' does not exist"
+        return 1
+    fi
+    echo "$expanded"
+}
 
-    local exec_cmd=""
-    if [[ -n "$dir" && "$dir" != "null" ]]; then
-        local expanded_dir="${dir/#\~/$HOME}"
-        if [[ ! -d "$expanded_dir" ]]; then
-            log "Warning: directory '$dir' does not exist"
-            return 1
-        fi
-        exec_cmd="cd \"$expanded_dir\" && clear"
-        if [[ -n "$cmd" && "$cmd" != "null" ]]; then
-            exec_cmd="$exec_cmd && $cmd"
-        fi
-    elif [[ -n "$cmd" && "$cmd" != "null" ]]; then
-        exec_cmd="$cmd"
+# Global array to collect deferred send-keys commands.
+# Each entry is "pane_id<TAB>cmd" — flushed after all panes in a window are created.
+DEFERRED_CMDS=()
+# Track the last pane created by split-window, so we can wait for its shell.
+LAST_SPLIT_PANE=""
+
+# Wait for a pane's shell to be ready (prompt drawn) before sending keys.
+# Polls cursor_x — once the shell prompt appears, cursor moves past column 0.
+wait_for_pane() {
+    local pane="$1" cx
+    for _ in $(seq 1 50); do
+        cx=$(tmux display-message -p -t "$pane" '#{cursor_x}' 2>/dev/null) || return 0
+        [[ "$cx" -gt 0 ]] && return 0
+        sleep 0.02
+    done
+    # Timed out (1s) — proceed anyway
+    log "Warning: timed out waiting for pane $pane to be ready"
+}
+
+flush_deferred_cmds() {
+    [[ ${#DEFERRED_CMDS[@]} -eq 0 ]] && return
+
+    # Wait for the last split pane's shell to initialize before sending any keys.
+    # Earlier panes have had more time and are typically ready already.
+    if [[ -n "$LAST_SPLIT_PANE" ]]; then
+        wait_for_pane "$LAST_SPLIT_PANE"
     fi
 
-    echo "$exec_cmd"
+    local pane_id cmd
+    for entry in "${DEFERRED_CMDS[@]}"; do
+        pane_id="${entry%%	*}"
+        cmd="${entry#*	}"
+        log "Sending cmd to $pane_id: $cmd"
+        tmux send-keys -t "$pane_id" "$cmd" C-m
+    done
+    DEFERRED_CMDS=()
+    LAST_SPLIT_PANE=""
 }
 
 # Recursively create panes from the YAML pane tree.
@@ -116,24 +144,29 @@ build_exec_cmd() {
 # For the root call, parent_pane_id is the existing first pane, split_direction is "".
 #
 # Each pane spec is a JSON object that may contain:
-#   cmd:  command to run in the pane
-#   dir:  working directory
-#   size: percentage for the split
-#   h:    child pane spec to split horizontally (side by side)
-#   v:    child pane spec to split vertically (top/bottom)
+#   cmd:   command to run in the pane
+#   dir:   working directory
+#   size:  percentage for the split
+#   split: ordered list of child split specs, each item shaped as:
+#          - h: { ...child pane spec... }
+#          - v: { ...child pane spec... }
+#
+# Multiple same-orientation splits for the same parent are supported because
+# child splits are read from the ordered split[] array instead of fixed h/v keys.
+# Pane creation happens immediately, but commands are deferred to DEFERRED_CMDS
+# and sent after all panes in the window exist.
 process_pane_tree() {
     local pane_spec="$1"
     local parent="$2"
     local split_dir="$3"
 
-    local cmd dir size
+    local cmd dir size split_count
     cmd=$(yq -r '.cmd // empty' <<< "$pane_spec")
     dir=$(yq -r '.dir // empty' <<< "$pane_spec")
     size=$(yq -r '.size // empty' <<< "$pane_spec")
+    split_count=$(yq -r '.split | length // 0' <<< "$pane_spec" 2>/dev/null || printf '0')
 
-    local exec_cmd
-    exec_cmd=$(build_exec_cmd "$cmd" "$dir") || true
-    local current_pane
+    local current_pane expanded_dir
 
     if [[ -n "$split_dir" ]]; then
         # This is a child pane — split from parent
@@ -148,25 +181,35 @@ process_pane_tree() {
             split_args+=("-p" "$size")
         fi
 
+        # Use -c for working directory if specified
+        if [[ -n "$dir" ]]; then
+            expanded_dir=$(expand_dir "$dir") && split_args+=("-c" "$expanded_dir")
+        fi
+
         current_pane=$(tmux split-window -P -F '#{pane_id}' "${split_args[@]}")
+        LAST_SPLIT_PANE="$current_pane"
         log "Split $split_dir from $parent -> $current_pane"
     else
-        # Root pane — parent is already the first pane of the window
+        # Root pane — parent is already the first pane of the window.
+        # Apply working directory via send-keys cd (no split to attach -c to).
         current_pane="$parent"
-    fi
-
-    if [[ -n "$exec_cmd" && -n "$current_pane" ]]; then
-        log "Sending cmd to $current_pane: $exec_cmd"
-        tmux send-keys -t "$current_pane" "$exec_cmd" C-m
-    fi
-
-    # Recurse into h/v child splits (direct keys on the pane node)
-    local child_spec
-    for dir_key in h v; do
-        child_spec=$(yq -r ".$dir_key // empty" <<< "$pane_spec")
-        if [[ -n "$child_spec" ]]; then
-            process_pane_tree "$child_spec" "$current_pane" "$dir_key"
+        if [[ -n "$dir" ]]; then
+            expanded_dir=$(expand_dir "$dir") && DEFERRED_CMDS+=("${current_pane}	cd \"$expanded_dir\" && clear")
         fi
+    fi
+
+    # Defer the command to be sent after all panes are created
+    if [[ -n "$cmd" && -n "$current_pane" ]]; then
+        DEFERRED_CMDS+=("${current_pane}	${cmd}")
+    fi
+
+    local split_idx child_dir child_spec
+    for ((split_idx=0; split_idx<split_count; split_idx++)); do
+        child_dir=$(yq -r ".split[$split_idx] | keys | .[0]" <<< "$pane_spec")
+        [[ "$child_dir" != "h" && "$child_dir" != "v" ]] && continue
+        child_spec=$(yq -r ".split[$split_idx].$child_dir" <<< "$pane_spec")
+        [[ -z "$child_spec" || "$child_spec" == "null" ]] && continue
+        process_pane_tree "$child_spec" "$current_pane" "$child_dir"
     done
 }
 
@@ -224,9 +267,10 @@ reorder_windows() {
 
 # --- PRUNE ACTION ---
 if [[ "$ACTION" == "prune" ]]; then
-    mapfile -t config_sessions < <(yq -r 'keys | .[]' "$CONFIG" | grep -v '^$')
+    mapfile -t config_sessions < <(yq -r 'keys_unsorted | .[]' "$CONFIG" | grep -v '^$')
 
-    for session in $(tmux list-sessions -F '#{session_name}' 2>/dev/null); do
+    mapfile -t live_sessions < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+    for session in "${live_sessions[@]}"; do
         session_found=0
         for cs in "${config_sessions[@]}"; do
             [[ "$cs" == "$session" ]] && session_found=1 && break
@@ -240,7 +284,8 @@ if [[ "$ACTION" == "prune" ]]; then
             mapfile -t config_windows < <(yq -r ".\"$session\"[] | keys | .[]" "$CONFIG" | grep -v '^$')
             window_count=$(tmux list-windows -t "=$session" 2>/dev/null | wc -l)
 
-            for window in $(tmux list-windows -t "=$session" -F '#{window_name}' 2>/dev/null); do
+            mapfile -t live_windows < <(tmux list-windows -t "=$session" -F '#{window_name}' 2>/dev/null)
+            for window in "${live_windows[@]}"; do
                 window_found=0
                 for cw in "${config_windows[@]}"; do
                     [[ "$cw" == "$window" ]] && window_found=1 && break
@@ -262,7 +307,7 @@ fi
 
 # --- DEFAULT / ATTACH / LIST ACTION ---
 
-mapfile -t yaml_sessions < <(yq -r 'keys | .[]' "$CONFIG" | grep -v '^$')
+mapfile -t yaml_sessions < <(yq -r 'keys_unsorted | .[]' "$CONFIG" | grep -v '^$')
 
 for session in "${yaml_sessions[@]}"; do
     [[ -z "$session" ]] && continue
@@ -300,14 +345,16 @@ for session in "${yaml_sessions[@]}"; do
         root_pane_spec=$(yq -r '.["'"$session"'"]['"$window_idx"']["'"$window_name"'"].root' "$CONFIG")
 
         if [[ -n "$root_pane_spec" && "$root_pane_spec" != "null" && -n "$first_pane" ]]; then
+            DEFERRED_CMDS=()
             process_pane_tree "$root_pane_spec" "$first_pane" ""
+            flush_deferred_cmds
         fi
     done
 done
 
 # --- POST-ACTION ---
 
-first_session=$(yq -r 'keys | .[0]' "$CONFIG")
+first_session=$(yq -r 'keys_unsorted | .[0]' "$CONFIG")
 
 if [[ "$ACTION" == "attach" ]]; then
     if [[ -n "$TMUX" ]]; then
